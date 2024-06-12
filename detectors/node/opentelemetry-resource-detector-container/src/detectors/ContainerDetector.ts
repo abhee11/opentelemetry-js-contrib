@@ -19,10 +19,12 @@ import {
   ResourceDetectionConfig,
 } from '@opentelemetry/resources';
 
-import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
+import { SEMRESATTRS_CONTAINER_ID } from '@opentelemetry/semantic-conventions';
 
 import * as fs from 'fs';
 import * as util from 'util';
+import * as https from 'https';
+import { RequestOptions } from 'https';
 import { diag } from '@opentelemetry/api';
 
 export class ContainerDetector implements Detector {
@@ -31,17 +33,25 @@ export class ContainerDetector implements Detector {
   readonly DEFAULT_CGROUP_V2_PATH = '/proc/self/mountinfo';
   readonly UTF8_UNICODE = 'utf8';
   readonly HOSTNAME = 'hostname';
-
+  readonly K8_TOKEN_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/token';
+  readonly K8_CERTIFICATE_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt';
+  readonly K8_NAMESPACE_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/namespace';
   private static readFileAsync = util.promisify(fs.readFile);
 
   async detect(_config?: ResourceDetectionConfig): Promise<Resource> {
     try {
-      const containerId = await this._getContainerId();
+      let containerId = '';
+      const isKubernetesEnvironment = this.isInKubernetesEnvironment();
+      if (isKubernetesEnvironment) {
+        containerId = await this._getContainerIdK8();
+      } else {
+        containerId = (await this._getContainerId()) || '';
+      }
       return !containerId
         ? Resource.empty()
         : new Resource({
-            [SemanticResourceAttributes.CONTAINER_ID]: containerId,
-          });
+          [SEMRESATTRS_CONTAINER_ID]: containerId,
+        });
     } catch (e) {
       diag.info(
         'Container Detector did not identify running inside a supported container, no container attributes will be added to resource: ',
@@ -98,6 +108,79 @@ export class ContainerDetector implements Detector {
       ?.split('/')
       .find(s => s.length === this.CONTAINER_ID_LENGTH);
     return containerIdStr || '';
+  }
+
+  private async getKubernetesApiOptions(path: string): RequestOptions {
+    const token = fs.readFileSync(this.K8_TOKEN_PATH, 'utf8');
+    const ca = fs.readFileSync(this.K8_CERTIFICATE_PATH, 'utf8');
+    return {
+      hostname: process.env.KUBERNETES_SERVICE_HOST,
+      port: parseInt(process.env.KUBERNETES_SERVICE_PORT_HTTPS || '443', 10),
+      path: path,
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+      },
+      ca: ca,
+    };
+  }
+
+  async fetchKubernetesApi(path: string): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const options = this.getKubernetesApiOptions(path);
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (error) {
+            reject(error);
+          }
+        });
+      });
+      req.on('error', reject);
+      req.end();
+    });
+  }
+
+
+  private isInKubernetesEnvironment(): boolean {
+    try {
+      fs.accessSync(this.K8_TOKEN_PATH, fs.constants.R_OK);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  private async _getContainerIdK8() {
+
+    const namespace = fs.readFileSync(this.K8_NAMESPACE_PATH, 'utf8').trim();
+    const podName = process.env.POD_NAME;
+    const containerName = process.env.CONTAINER_NAME;
+
+    if (podName) {
+      const path = `/api/v1/namespaces/${namespace}/pods/${podName}`;
+      const podData = await this.fetchKubernetesApi(path);
+      const containerStatus = podData.status.containerStatuses.find((status: any) => status.name === containerName);
+      if (containerStatus && containerStatus.containerID) {
+        return containerStatus.containerID.replace(/^.*:\/\/(.+)$/, '$1');
+      } else {
+        throw new Error(`Container "${containerName}" not found in pod "${podName}".`);
+      }
+    } else {
+      // If POD_NAME is not provided, loop through all pods
+      const path = `/api/v1/namespaces/${namespace}/pods`;
+      const podsData = await this.fetchKubernetesApi(path);
+      for (const pod of podsData.items) {
+        const containerStatus = pod.status.containerStatuses.find((status: any) => status.name === containerName);
+        if (containerStatus && containerStatus.containerID) {
+          return containerStatus.containerID.replace(/^.*\/([^\/]+)$/, '$1');
+        }
+      }
+      throw new Error(`Container "${containerName}" not found in any pods.`);
+    }
   }
 
   /*
